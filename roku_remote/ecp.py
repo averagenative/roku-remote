@@ -44,6 +44,12 @@ def launch_app(ip: str, app_id: str):
     _check(requests.post(f"http://{ip}:8060/launch/{app_id}", timeout=TIMEOUT))
 
 
+def is_limited_mode(ip: str) -> bool:
+    xml = _check(requests.get(f"http://{ip}:8060/query/device-info", timeout=TIMEOUT)).text
+    mode = ElementTree.fromstring(xml).findtext("ecp-setting-mode", "default")
+    return mode.lower() == "limited"
+
+
 def send_text(ip: str, text: str):
     for char in text:
         send_key(ip, f"Lit_{quote(char, safe='')}")

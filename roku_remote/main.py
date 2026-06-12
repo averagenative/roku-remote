@@ -238,14 +238,14 @@ class RemoteWindow(QMainWindow):
         layout.addLayout(extras)
 
         media = QHBoxLayout()
-        media.addWidget(self._key_button("⏪", "Rev"))
-        media.addWidget(self._key_button("⏯", "Play"))
-        media.addWidget(self._key_button("⏩", "Fwd"))
+        media.addWidget(self._key_button("◀◀ Rew", "Rev"))
+        media.addWidget(self._key_button("▶ Play/Pause", "Play"))
+        media.addWidget(self._key_button("FF ▶▶", "Fwd"))
         layout.addLayout(media)
 
         volume = QHBoxLayout()
         volume.addWidget(self._key_button("Vol −", "VolumeDown"))
-        volume.addWidget(self._key_button("\U0001f507", "VolumeMute"))
+        volume.addWidget(self._key_button("Mute", "VolumeMute"))
         volume.addWidget(self._key_button("Vol +", "VolumeUp"))
         layout.addLayout(volume)
 
@@ -413,6 +413,11 @@ class RemoteWindow(QMainWindow):
 
     def load_apps(self):
         self.run_job(ecp.get_apps, self.ip, on_done=self._apps_loaded)
+        self.run_job(ecp.is_limited_mode, self.ip, on_done=self._mode_checked, quiet=True)
+
+    def _mode_checked(self, limited):
+        if limited:
+            self.set_status(ecp.LIMITED_MODE_HINT, sticky=True)
 
     def _apps_loaded(self, apps):
         while self.apps_row.count():
@@ -453,7 +458,7 @@ class RemoteWindow(QMainWindow):
         if on_done:
             worker.signals.done.connect(on_done)
         if not quiet:
-            worker.signals.failed.connect(lambda msg: self.set_status(f"Error: {msg}"))
+            worker.signals.failed.connect(lambda msg: self.set_status(f"Error: {msg}", sticky=True))
         worker.setAutoDelete(True)
         self._hold = getattr(self, "_hold", [])
         self._hold.append(worker.signals)
@@ -461,9 +466,10 @@ class RemoteWindow(QMainWindow):
         worker.signals.failed.connect(lambda *_: self._hold.remove(worker.signals))
         self.pool.start(worker)
 
-    def set_status(self, message):
+    def set_status(self, message, sticky=False):
         self.status.setText(message)
-        QTimer.singleShot(6000, lambda: self.status.text() == message and self.status.setText(KEY_HINTS))
+        if not sticky:
+            QTimer.singleShot(6000, lambda: self.status.text() == message and self.status.setText(KEY_HINTS))
 
 
 def _icon_path():
