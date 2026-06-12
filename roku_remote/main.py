@@ -1,15 +1,15 @@
 """Roku Remote — a desktop remote styled after the Roku phone app.
 
-Discovery, device info, and power toggling come from the controku
-library (GPL-3); apps/icons/text input are in ecp.py. All network I/O
-runs on a QThreadPool so the UI never blocks on an unreachable TV.
+All ECP traffic (discovery, device info, keys, apps, text) lives in
+ecp.py. All network I/O runs on a QThreadPool so the UI never blocks
+on an unreachable TV.
 """
 
 import json
 import sys
 from pathlib import Path
 
-from controku import controku
+import requests
 from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
@@ -135,11 +135,11 @@ KEY_HINTS = (
 
 
 class Worker(QRunnable):
-    """Run a callable on the thread pool, signal result or error message."""
+    """Run a callable on the thread pool, signal result or the exception."""
 
     class Signals(QObject):
         done = Signal(object)
-        failed = Signal(str)
+        failed = Signal(object)
 
     def __init__(self, fn, *args):
         super().__init__()
@@ -152,7 +152,7 @@ class Worker(QRunnable):
             try:
                 result = self.fn(*self.args)
             except Exception as exc:
-                self.signals.failed.emit(str(exc) or type(exc).__name__)
+                self.signals.failed.emit(exc)
             else:
                 self.signals.done.emit(result)
         except RuntimeError:
@@ -166,6 +166,7 @@ class RemoteWindow(QMainWindow):
         self.pool = QThreadPool.globalInstance()
         self.settings = QSettings("roku-remote", "roku-remote")
         self.devices = json.loads(self.settings.value("devices", "[]"))
+        self._recovering = False
 
         self._build_ui()
         self._bind_keys()
@@ -342,24 +343,57 @@ class RemoteWindow(QMainWindow):
         self.settings.setValue("devices", json.dumps(self.devices))
 
     def _device_changed(self):
+        self._recovering = False
         if self.ip:
             self.settings.setValue("last_ip", self.ip)
             self.load_apps()
 
     def discover(self):
+        self._recovering = False
         self.set_status("Searching for Roku devices…")
-        self.run_job(controku.discover_devices, on_done=self._discovered)
+        self.run_job(ecp.discover, on_done=self._discovered)
+
+    def _merge_devices(self, found):
+        """Fold discovery results into the saved list, matching by serial
+        first so a TV that moved to a new DHCP address is updated in place
+        instead of duplicated. Saved entries from before serials were
+        stored match by name before IP: DHCP can shuffle addresses
+        *between* the user's own Rokus, so a same-IP match may be a
+        different device while a same-name match rarely is. Returns the
+        genuinely new devices."""
+        new = []
+        for device in found:
+            serial = device.get("serial")
+            legacy = [d for d in self.devices if not d.get("serial")]
+            existing = (
+                next((d for d in self.devices if serial and d.get("serial") == serial), None)
+                or next((d for d in legacy if d["name"] == device["name"]), None)
+                or next((d for d in legacy if d["ip"] == device["ip"]), None)
+            )
+            if existing:
+                existing.update(device)
+            else:
+                self.devices.append(device)
+                new.append(device)
+        return new
+
+    def _apply_discovery(self, found):
+        # The selected entry may get a new IP during the merge; re-point
+        # last_ip at it so the rebuilt combo keeps the same device selected.
+        selected = next((d for d in self.devices if d["ip"] == self.ip), None)
+        new = self._merge_devices(found)
+        self._save_devices()
+        if selected:
+            self.settings.setValue("last_ip", selected["ip"])
+        self._restore_devices()
+        return selected, new
 
     def _discovered(self, found):
-        known = {d["ip"] for d in self.devices}
-        new = [d for d in found if d["ip"] not in known]
-        self.devices.extend(new)
-        if found:
-            self._save_devices()
-            self._restore_devices()
-            self.set_status(f"Found {len(found)} device(s), {len(new)} new")
-        else:
+        if not found:
             self.set_status("No devices found — try adding by IP (+)")
+            return
+        _, new = self._apply_discovery(found)
+        self.set_status(f"Found {len(found)} device(s), {len(new)} new")
 
     def add_by_ip(self):
         ip, accepted = QInputDialog.getText(self, "Add Roku by IP", "Device IP address:")
@@ -367,15 +401,43 @@ class RemoteWindow(QMainWindow):
         if not accepted or not ip:
             return
         self.set_status(f"Checking {ip}…")
-        self.run_job(controku.get_device, ip, on_done=self._ip_added)
+        self.run_job(ecp.get_device, ip, on_done=self._ip_added)
 
     def _ip_added(self, device):
-        self.devices = [d for d in self.devices if d["ip"] != device["ip"]]
-        self.devices.append({"name": device["name"], "ip": device["ip"]})
+        self._merge_devices([device])
         self._save_devices()
         self._restore_devices()
         self.device_box.setCurrentIndex(self.device_box.findData(device["ip"]))
         self.set_status(f"Added {device['name']}")
+
+    # ---- unreachable-device recovery ----
+
+    def _device_unreachable(self):
+        if self._recovering:
+            return
+        self._recovering = True
+        name = self.device_box.currentText() or "the TV"
+        self.set_status(f"Can't reach {name} — rescanning the network…", sticky=True)
+        self.run_job(ecp.discover, on_done=self._recovery_done, on_failed=self._recovery_failed)
+
+    def _recovery_done(self, found):
+        old_ip = self.ip
+        selected, _ = self._apply_discovery(found)
+        if selected and selected["ip"] != old_ip:
+            self._recovering = False
+            self.set_status(f"{selected['name']} moved to {selected['ip']} — reconnected, try again")
+        elif selected and any(d["ip"] == selected["ip"] for d in found):
+            self._recovering = False
+            self.set_status(f"{selected['name']} is reachable again — try again")
+        else:
+            # Stay latched: _apply_discovery just retried load_apps on the
+            # dead IP, and its failure must not start another scan.
+            self.set_status(
+                "TV not found — check it's on and connected, or add its new IP (+)", sticky=True
+            )
+
+    def _recovery_failed(self, exc):
+        self.set_status("TV unreachable and network scan failed — check your connection", sticky=True)
 
     # ---- remote actions ----
 
@@ -391,10 +453,7 @@ class RemoteWindow(QMainWindow):
 
     @staticmethod
     def _toggle_power(ip):
-        # controku.toggle_power swallows HTTP errors; route the keypress
-        # through ecp.send_key so Limited-mode 403s surface in the UI.
-        device = controku.get_device(ip)
-        ecp.send_key(ip, "PowerOff" if device["power"] else "PowerOn")
+        ecp.send_key(ip, "PowerOff" if ecp.get_power(ip) else "PowerOn")
 
     def send_text(self):
         text = self.text_input.text()
@@ -453,18 +512,26 @@ class RemoteWindow(QMainWindow):
 
     # ---- plumbing ----
 
-    def run_job(self, fn, *args, on_done=None, quiet=False):
+    def run_job(self, fn, *args, on_done=None, on_failed=None, quiet=False):
         worker = Worker(fn, *args)
         if on_done:
             worker.signals.done.connect(on_done)
-        if not quiet:
-            worker.signals.failed.connect(lambda msg: self.set_status(f"Error: {msg}", sticky=True))
+        if on_failed:
+            worker.signals.failed.connect(on_failed)
+        elif not quiet:
+            worker.signals.failed.connect(self._job_failed)
         worker.setAutoDelete(True)
         self._hold = getattr(self, "_hold", [])
         self._hold.append(worker.signals)
         worker.signals.done.connect(lambda *_: self._hold.remove(worker.signals))
         worker.signals.failed.connect(lambda *_: self._hold.remove(worker.signals))
         self.pool.start(worker)
+
+    def _job_failed(self, exc):
+        if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            self._device_unreachable()
+        else:
+            self.set_status(f"Error: {exc!s}" if str(exc) else f"Error: {type(exc).__name__}", sticky=True)
 
     def set_status(self, message, sticky=False):
         self.status.setText(message)

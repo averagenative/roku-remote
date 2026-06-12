@@ -20,7 +20,7 @@ fi
 
 # PySide6 is pinned: Qt >= 6.7 links Windows' system icuuc.dll, which Wine
 # doesn't provide — newer versions break both this build and the smoke test.
-wine "$PYEXE" -m pip install --upgrade --quiet "pyside6==6.6.3.1" controku requests pillow pyinstaller
+wine "$PYEXE" -m pip install --upgrade --quiet "pyside6==6.6.3.1" requests pillow pyinstaller
 
 wine "$PYEXE" -c "from PIL import Image; Image.open('assets/roku-remote.png').save('build/roku-remote.ico', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
 
