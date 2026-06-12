@@ -4,10 +4,14 @@ A Linux desktop Roku remote styled after the Roku phone app: dark purple
 theme, D-pad, media/volume keys, channel shortcuts with real app icons,
 and keyboard text input. Ships as a single AppImage.
 
-Built on [controku](https://github.com/benthetechguy/controku) (GPL-3)
-for SSDP discovery and ECP basics, with extra ECP endpoints (app list,
-icons, launch, `Lit_` text input) in `roku_remote/ecp.py`. Everything
-talks to port 8060 on the device — no cloud, no account.
+All device control is plain [ECP](https://developer.roku.com/docs/developer-program/dev-tools/external-control-api.md)
+over HTTP, implemented in `roku_remote/ecp.py`: SSDP discovery, key
+presses, app list/icons/launch, and `Lit_` text input. Everything talks
+to port 8060 on the device — no cloud, no account.
+
+Devices are remembered by serial number, so when DHCP moves a Roku to a
+new address the app rescans automatically and reconnects instead of
+erroring at the stale IP.
 
 ## One-time TV setting (important)
 
@@ -61,4 +65,4 @@ in `~/.config/roku-remote/`; use ⟳ to re-discover or + to add by IP.
 
 ## License
 
-GPL-3.0 (inherited from the controku dependency).
+MIT.
