@@ -337,7 +337,7 @@ class RemoteWindow(QMainWindow):
             self.device_box.setCurrentIndex(index)
         self.device_box.blockSignals(False)
         if self.ip:
-            self.load_apps()
+            self.connect()
 
     def _save_devices(self):
         self.settings.setValue("devices", json.dumps(self.devices))
@@ -346,7 +346,27 @@ class RemoteWindow(QMainWindow):
         self._recovering = False
         if self.ip:
             self.settings.setValue("last_ip", self.ip)
-            self.load_apps()
+            self.connect()
+
+    def connect(self):
+        """Re-initiate a connection to the selected device before treating
+        it as live. A saved device that's off or gone must not masquerade
+        as connected: probe it first, then either confirm and load apps or
+        fall into the unreachable-recovery path (via _job_failed)."""
+        if not self.ip:
+            return
+        name = self.device_box.currentText()
+        self.set_status(f"Connecting to {name}…", sticky=True)
+        self.run_job(ecp.get_device, self.ip, on_done=self._connected)
+
+    def _connected(self, device):
+        # Fold in any name/serial/ip drift picked up on reconnect, then
+        # show a clear connected state and load the app shortcuts.
+        self._recovering = False
+        self._merge_devices([device])
+        self._save_devices()
+        self.set_status(f"Connected to {device['name']}")
+        self.load_apps()
 
     def discover(self):
         self._recovering = False
