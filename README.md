@@ -32,7 +32,7 @@ Download the file for your system from the [releases page](https://github.com/av
 
 ### Linux
 
-The AppImage runs on 64-bit Linux with glibc 2.43 or newer, such as Fedora 44. On other distributions, [run Roku Remote from source](#run-from-source).
+The AppImage runs on 64-bit Linux distributions with glibc 2.28 or newer, which includes Ubuntu 20.04 and later, Debian 10 and later, Linux Mint 20 and later, Fedora, and RHEL 8 and later. On older systems, [run Roku Remote from source](#run-from-source).
 
 1. Download `roku-remote-x86_64.AppImage`.
 2. Make it executable:
@@ -137,12 +137,15 @@ python3 -m venv .venv
 
 ### Build the Linux AppImage
 
+The build runs inside an AlmaLinux 8 container so that the AppImage works on systems as old as glibc 2.28. You need [Distrobox](https://distrobox.it/) and Podman.
+
 ```
-.venv/bin/pip install pyinstaller
 ./build-appimage.sh
 ```
 
-The script produces `roku-remote-x86_64.AppImage` with PyInstaller and appimagetool.
+The script produces `roku-remote-x86_64.AppImage` with PyInstaller and appimagetool. On the first run, it creates a container named `roku-remote-build` and installs the build tools in it, which takes a few minutes. The script prints the oldest glibc version that the AppImage needs.
+
+To build on your own system instead, which is faster but produces an AppImage that only runs on systems as new as yours, run `NATIVE=1 ./build-appimage.sh` after you install PyInstaller in `.venv`.
 
 ### Build the Windows executable
 
@@ -160,13 +163,13 @@ The script builds `roku-remote-windows-x86_64.exe` on Linux with Wine and the Wi
 
 The script copies the AppImage to `~/Applications/`, installs the icon, and registers `~/.local/share/applications/roku-remote.desktop`, so GNOME search and other app launchers find Roku Remote. Run it again after each rebuild.
 
-### Regenerate the screenshot
+### Regenerate the screenshots
 
 ```
 .venv/bin/python assets/gen_screenshot.py ROKU_IP
 ```
 
-Replace `ROKU_IP` with the address of a Roku on your network to fill the channel row with its app icons. The screenshot always shows a placeholder device name.
+The script writes `docs/screenshot.png` and `docs/social-preview.png`, the image GitHub shows when someone shares a link to the repository. Replace `ROKU_IP` with the address of a Roku on your network to fill the channel row with its app icons. Both images always show a placeholder device name.
 
 ## License
 
