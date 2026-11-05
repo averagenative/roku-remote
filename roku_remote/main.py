@@ -6,6 +6,9 @@ on an unreachable TV.
 """
 
 import json
+import logging
+import logging.handlers
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +32,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import ecp
+from . import __version__, ecp
+
+log = logging.getLogger("roku_remote")
 
 ROKU_PURPLE = "#662d91"
 ROKU_PURPLE_LIGHT = "#7b3fae"
@@ -128,6 +133,19 @@ QPushButton#appButton {{
 }}
 """
 
+# How often to rescan for a selected TV that couldn't be found, so it
+# reconnects on its own once it's powered on or back on the network:
+# every 10 s for the first minute, then once a minute so a TV that's
+# unplugged overnight doesn't mean a scan (and log lines) every 10 s.
+# Pressing a remote button while it's searching rescans immediately.
+RETRY_MS = 10_000
+RETRY_SLOW_MS = 60_000
+RETRY_FAST_ATTEMPTS = 6
+
+# How often to re-check the connected TV, so an IP change or deep sleep
+# is caught and recovered before the next keypress rather than by it.
+HEARTBEAT_MS = 30_000
+
 KEY_HINTS = (
     "Arrows: navigate   Enter: OK   Backspace: back   "
     "H: home   Space: play/pause   ,/.: rew/ff   -/=: volume   M: mute"
@@ -167,6 +185,15 @@ class RemoteWindow(QMainWindow):
         self.settings = QSettings("roku-remote", "roku-remote")
         self.devices = json.loads(self.settings.value("devices", "[]"))
         self._recovering = False
+        self._retries = 0
+        self._scanning = False
+        self._retry = QTimer(self)
+        self._retry.setSingleShot(True)
+        self._retry.timeout.connect(self._rescan)
+        self._heartbeat = QTimer(self)
+        self._heartbeat.setInterval(HEARTBEAT_MS)
+        self._heartbeat.timeout.connect(self._check_alive)
+        self._heartbeat.start()
 
         self._build_ui()
         self._bind_keys()
@@ -177,6 +204,14 @@ class RemoteWindow(QMainWindow):
     @property
     def ip(self):
         return self.device_box.currentData()
+
+    @property
+    def selected(self):
+        """The saved entry for the selected combo row. Combo rows mirror
+        self.devices in order, so this stays right even when two stale
+        entries briefly share an IP."""
+        index = self.device_box.currentIndex()
+        return self.devices[index] if 0 <= index < len(self.devices) else None
 
     def _build_ui(self):
         root = QWidget()
@@ -331,8 +366,10 @@ class RemoteWindow(QMainWindow):
         self.device_box.clear()
         for device in self.devices:
             self.device_box.addItem(f"{device['name']}  ({device['ip']})", device["ip"])
-        last = self.settings.value("last_ip")
-        index = self.device_box.findData(last)
+        index = self._index_of({
+            "serial": self.settings.value("last_serial"),
+            "ip": self.settings.value("last_ip"),
+        })
         if index >= 0:
             self.device_box.setCurrentIndex(index)
         self.device_box.blockSignals(False)
@@ -342,10 +379,27 @@ class RemoteWindow(QMainWindow):
     def _save_devices(self):
         self.settings.setValue("devices", json.dumps(self.devices))
 
+    @staticmethod
+    def _same_device(a, b):
+        # Serial is the only stable identity: DHCP shuffles IPs, even
+        # between the user's own Rokus. IP is the fallback for entries
+        # saved before serials were stored.
+        if a.get("serial") and b.get("serial"):
+            return a["serial"] == b["serial"]
+        return bool(a.get("ip")) and a.get("ip") == b.get("ip")
+
+    def _index_of(self, device):
+        return next((i for i, d in enumerate(self.devices) if self._same_device(d, device)), -1)
+
+    def _remember_selection(self, device):
+        self.settings.setValue("last_serial", device.get("serial") or "")
+        self.settings.setValue("last_ip", device["ip"])
+
     def _device_changed(self):
-        self._recovering = False
-        if self.ip:
-            self.settings.setValue("last_ip", self.ip)
+        self._end_recovery()
+        if self.selected:
+            log.info("User selected %s", self._describe(self.selected))
+            self._remember_selection(self.selected)
             self.connect()
 
     def connect(self):
@@ -357,19 +411,33 @@ class RemoteWindow(QMainWindow):
             return
         name = self.device_box.currentText()
         self.set_status(f"Connecting to {name}…", sticky=True)
-        self.run_job(ecp.get_device, self.ip, on_done=self._connected)
+        want = self.selected
+        log.info("Connecting to %s", self._describe(want))
+        self.run_job(ecp.get_device, self.ip, on_done=lambda device: self._connected(device, want))
 
-    def _connected(self, device):
-        # Fold in any name/serial/ip drift picked up on reconnect, then
+    def _connected(self, device, want):
+        if want is not self.selected:
+            return  # the user picked another device while this probe ran
+        if not self._same_device(device, want):
+            # A different Roku answered at the saved address: DHCP handed
+            # this TV's old IP to another of the user's devices. Don't
+            # claim a connection to the wrong TV; rescan to find the
+            # right one by serial.
+            log.warning("Wrong TV at %s: expected %s, got %s", want["ip"], self._describe(want), self._describe(device))
+            self._device_unreachable()
+            return
+        # Fold in any name/serial drift picked up on reconnect, then
         # show a clear connected state and load the app shortcuts.
-        self._recovering = False
+        log.info("Connected to %s", self._describe(device))
+        self._end_recovery()
         self._merge_devices([device])
         self._save_devices()
         self.set_status(f"Connected to {device['name']}")
         self.load_apps()
 
     def discover(self):
-        self._recovering = False
+        log.info("Manual rescan requested")
+        self._end_recovery()
         self.set_status("Searching for Roku devices…")
         self.run_job(ecp.discover, on_done=self._discovered)
 
@@ -398,13 +466,13 @@ class RemoteWindow(QMainWindow):
         return new
 
     def _apply_discovery(self, found):
-        # The selected entry may get a new IP during the merge; re-point
-        # last_ip at it so the rebuilt combo keeps the same device selected.
-        selected = next((d for d in self.devices if d["ip"] == self.ip), None)
+        # The selected entry may get a new IP during the merge; remember it
+        # by serial so the rebuilt combo keeps the same device selected.
+        selected = self.selected
         new = self._merge_devices(found)
         self._save_devices()
         if selected:
-            self.settings.setValue("last_ip", selected["ip"])
+            self._remember_selection(selected)
         self._restore_devices()
         return selected, new
 
@@ -427,7 +495,7 @@ class RemoteWindow(QMainWindow):
         self._merge_devices([device])
         self._save_devices()
         self._restore_devices()
-        self.device_box.setCurrentIndex(self.device_box.findData(device["ip"]))
+        self.device_box.setCurrentIndex(self._index_of(device))
         self.set_status(f"Added {device['name']}")
 
     # ---- unreachable-device recovery ----
@@ -436,28 +504,99 @@ class RemoteWindow(QMainWindow):
         if self._recovering:
             return
         self._recovering = True
+        self._retries = 0
+        log.warning("Lost %s; rescanning the network", self._describe(self.selected))
         name = self.device_box.currentText() or "the TV"
         self.set_status(f"Can't reach {name} — rescanning the network…", sticky=True)
-        self.run_job(ecp.discover, on_done=self._recovery_done, on_failed=self._recovery_failed)
+        self._rescan()
+
+    def _rescan(self):
+        if self._recovering and not self._scanning:
+            self._scanning = True
+            self.run_job(ecp.discover, on_done=self._recovery_done, on_failed=self._recovery_failed)
+
+    def _schedule_retry(self):
+        self._retries += 1
+        delay = RETRY_MS if self._retries <= RETRY_FAST_ATTEMPTS else RETRY_SLOW_MS
+        self._retry.start(delay)
+        return delay // 1000
+
+    def _end_recovery(self):
+        self._recovering = False
+        self._retry.stop()
 
     def _recovery_done(self, found):
+        self._scanning = False
+        if not self._recovering:
+            return  # superseded by a manual rescan or a device switch
         old_ip = self.ip
+        log.info("Rescan found: %s", "; ".join(map(self._describe, found)) or "nothing")
         selected, _ = self._apply_discovery(found)
-        if selected and selected["ip"] != old_ip:
-            self._recovering = False
-            self.set_status(f"{selected['name']} moved to {selected['ip']} — reconnected, try again")
-        elif selected and any(d["ip"] == selected["ip"] for d in found):
-            self._recovering = False
-            self.set_status(f"{selected['name']} is reachable again — try again")
+        if selected and any(self._same_device(d, selected) for d in found):
+            log.info("Recovered %s (was at %s)", self._describe(selected), old_ip)
+            self._end_recovery()
+            if selected["ip"] != old_ip:
+                self.set_status(f"{selected['name']} moved to {selected['ip']} — reconnecting…")
+            else:
+                self.set_status(f"{selected['name']} is reachable again — reconnecting…")
         else:
-            # Stay latched: _apply_discovery just retried load_apps on the
-            # dead IP, and its failure must not start another scan.
+            # Stay latched: _apply_discovery just re-probed the dead IP,
+            # and its failure must not start a second scan. Keep retrying
+            # so the TV reconnects once it's powered on or back online.
+            delay = self._schedule_retry()
+            log.warning("%s not found (attempt %d); retrying in %d s",
+                        self._describe(selected), self._retries, delay)
             self.set_status(
-                "TV not found — check it's on and connected, or add its new IP (+)", sticky=True
+                "TV not found — retrying. Check it's on and connected, or add its new IP (+)",
+                sticky=True,
             )
 
     def _recovery_failed(self, exc):
-        self.set_status("TV unreachable and network scan failed — check your connection", sticky=True)
+        self._scanning = False
+        if not self._recovering:
+            return
+        delay = self._schedule_retry()
+        log.warning("Rescan failed (%s: %s, attempt %d); retrying in %d s",
+                    type(exc).__name__, exc, self._retries, delay)
+        self.set_status("TV unreachable and network scan failed — retrying…", sticky=True)
+
+    # ---- connection health ----
+
+    def _check_alive(self):
+        """Heartbeat: confirm the selected TV still answers at its saved
+        IP and is still the same TV (by serial). Silent while healthy;
+        on a failure or a different TV answering it starts the normal
+        recovery, so the remote already works when the next key is
+        pressed instead of failing it."""
+        if self._recovering or not self.ip:
+            return
+        want = self.selected
+        self.run_job(
+            ecp.get_device, self.ip,
+            on_done=lambda device: self._still_alive(device, want),
+            on_failed=lambda exc: self._heartbeat_failed(exc, want),
+        )
+
+    def _still_alive(self, device, want):
+        if want is not self.selected or self._recovering:
+            return
+        if not self._same_device(device, want):
+            log.warning("Heartbeat: wrong TV at %s: expected %s, got %s",
+                        want["ip"], self._describe(want), self._describe(device))
+            self._device_unreachable()
+
+    def _heartbeat_failed(self, exc, want):
+        if want is not self.selected or self._recovering:
+            return
+        log.warning("Heartbeat failed for %s: %s", self._describe(want), type(exc).__name__)
+        if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            self._device_unreachable()
+
+    @staticmethod
+    def _describe(device):
+        if not device:
+            return "no device"
+        return f"{device.get('name')} [{device.get('serial') or 'no serial'}] at {device.get('ip')}"
 
     # ---- remote actions ----
 
@@ -486,6 +625,13 @@ class RemoteWindow(QMainWindow):
         if not self.ip:
             self.set_status("No device selected — discover (⟳) or add by IP (+)")
             return False
+        if self._recovering and not self._scanning:
+            # The user is trying to use the TV right now: don't make them
+            # wait out the retry backoff. The command still goes to the
+            # saved IP, which works if the TV is back at the same address.
+            log.info("Button pressed while searching; rescanning now")
+            self._retry.stop()
+            self._rescan()
         return True
 
     # ---- app shortcuts ----
@@ -534,6 +680,10 @@ class RemoteWindow(QMainWindow):
 
     def run_job(self, fn, *args, on_done=None, on_failed=None, quiet=False):
         worker = Worker(fn, *args)
+        # Args are left out on purpose: send_text's are what the user typed.
+        worker.signals.failed.connect(
+            lambda exc, name=fn.__name__: log.debug("Job %s failed: %s: %s", name, type(exc).__name__, exc)
+        )
         if on_done:
             worker.signals.done.connect(on_done)
         if on_failed:
@@ -559,12 +709,47 @@ class RemoteWindow(QMainWindow):
             QTimer.singleShot(6000, lambda: self.status.text() == message and self.status.setText(KEY_HINTS))
 
 
+def log_path():
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "roku-remote" / "roku-remote.log"
+
+
+def _setup_logging():
+    """Debug log of every ECP request, connection state change and crash,
+    rotated at 2 MB with 4 old files kept. A log that can't be written
+    (read-only home, odd permissions) must never stop the remote."""
+    path = log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(path, maxBytes=2_000_000, backupCount=4, encoding="utf-8")
+    except OSError as exc:
+        print(f"roku-remote: can't write log at {path}: {exc}", file=sys.stderr)
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    root = logging.getLogger("roku_remote")
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    # urllib3's own retry/connection chatter adds nothing _request doesn't.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    def excepthook(kind, value, tb):
+        log.critical("Uncaught exception", exc_info=(kind, value, tb))
+        sys.__excepthook__(kind, value, tb)
+
+    sys.excepthook = excepthook
+    log.info("Roku Remote %s starting (pid %d, %s, log %s)", __version__, os.getpid(), sys.platform, path)
+
+
 def _icon_path():
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent / "assets"))
     return base / "roku-remote.png"
 
 
 def main():
+    _setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("Roku Remote")
     app.setDesktopFileName("roku-remote")
@@ -573,7 +758,9 @@ def main():
         app.setWindowIcon(QIcon(str(_icon_path())))
     window = RemoteWindow()
     window.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    log.info("Roku Remote exiting (code %d)", code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

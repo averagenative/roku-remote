@@ -11,7 +11,11 @@ to port 8060 on the device — no cloud, no account.
 
 Devices are remembered by serial number, so when DHCP moves a Roku to a
 new address the app rescans automatically and reconnects instead of
-erroring at the stale IP.
+erroring at the stale IP. The app checks the selected TV every 30
+seconds, so a move or a TV dropping off the network is caught before
+your next key press. If the TV can't be found, the app keeps retrying
+(every 10 seconds for a minute, then every minute) and rescans right
+away when you press a button.
 
 ## One-time TV setting (important)
 
@@ -62,6 +66,17 @@ Copies the AppImage to `~/Applications/`, the icon to
 
 Shortcuts pause while the text field has focus. Devices are remembered
 in `~/.config/roku-remote/`; use ⟳ to re-discover or + to add by IP.
+
+## Debug log
+
+The app writes a debug log of every ECP request (status and timing),
+connection changes, rescans, and crashes:
+
+- Linux: `~/.local/state/roku-remote/roku-remote.log`
+- Windows: `%LOCALAPPDATA%\roku-remote\roku-remote.log`
+
+The log rotates at 2 MB and keeps four old files. Text you send to the
+TV is never logged; literal keypresses appear as `Lit_*`.
 
 ## License
 
