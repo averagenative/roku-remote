@@ -13,14 +13,11 @@ import sys
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QGridLayout,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -28,110 +25,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSizePolicy,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
 
-from . import __version__, ecp
+from . import __version__, ecp, ui
 
 log = logging.getLogger("roku_remote")
-
-ROKU_PURPLE = "#662d91"
-ROKU_PURPLE_LIGHT = "#7b3fae"
-ROKU_PURPLE_DARK = "#4a2068"
-BACKGROUND = "#17101f"
-SURFACE = "#241733"
-TEXT = "#f2eefa"
-
-STYLE = f"""
-QMainWindow, QDialog {{
-    background-color: {BACKGROUND};
-}}
-QLabel {{
-    color: {TEXT};
-    font-size: 13px;
-}}
-QLabel#statusLabel {{
-    color: #9b8fb0;
-    font-size: 11px;
-}}
-QComboBox {{
-    background-color: {SURFACE};
-    color: {TEXT};
-    border: 1px solid {ROKU_PURPLE};
-    border-radius: 8px;
-    padding: 6px 10px;
-    font-size: 13px;
-}}
-QComboBox::drop-down {{
-    border: none;
-    width: 24px;
-}}
-QComboBox QAbstractItemView {{
-    background-color: {SURFACE};
-    color: {TEXT};
-    selection-background-color: {ROKU_PURPLE};
-}}
-QLineEdit {{
-    background-color: {SURFACE};
-    color: {TEXT};
-    border: 1px solid {ROKU_PURPLE_DARK};
-    border-radius: 8px;
-    padding: 7px 10px;
-    font-size: 13px;
-}}
-QLineEdit:focus {{
-    border-color: {ROKU_PURPLE_LIGHT};
-}}
-QPushButton {{
-    background-color: {SURFACE};
-    color: {TEXT};
-    border: none;
-    border-radius: 10px;
-    padding: 10px;
-    font-size: 14px;
-}}
-QPushButton:hover {{
-    background-color: {ROKU_PURPLE_DARK};
-}}
-QPushButton:pressed {{
-    background-color: {ROKU_PURPLE};
-}}
-QPushButton#padButton {{
-    background-color: {ROKU_PURPLE};
-    font-size: 20px;
-    font-weight: bold;
-}}
-QPushButton#padButton:hover {{
-    background-color: {ROKU_PURPLE_LIGHT};
-}}
-QPushButton#padButton:pressed {{
-    background-color: {ROKU_PURPLE_DARK};
-}}
-QPushButton#okButton {{
-    background-color: {ROKU_PURPLE_DARK};
-    font-size: 16px;
-    font-weight: bold;
-    border-radius: 31px;
-}}
-QPushButton#okButton:hover {{
-    background-color: {ROKU_PURPLE};
-}}
-QPushButton#powerButton {{
-    background-color: {SURFACE};
-    color: #e05c5c;
-    font-size: 18px;
-    border-radius: 18px;
-}}
-QPushButton#powerButton:hover {{
-    background-color: #5c2020;
-}}
-QPushButton#appButton {{
-    background-color: {SURFACE};
-    border-radius: 12px;
-    padding: 4px;
-}}
-"""
 
 # How often to rescan for a selected TV that couldn't be found, so it
 # reconnects on its own once it's powered on or back on the network:
@@ -150,6 +51,13 @@ KEY_HINTS = (
     "Arrows: navigate   Enter: OK   Backspace: back   "
     "H: home   Space: play/pause   ,/.: rew/ff   -/=: volume   M: mute"
 )
+
+LINK_TIPS = {
+    "ok": "Connected",
+    "busy": "Connecting…",
+    "lost": "Not found",
+    "idle": "Not connected",
+}
 
 
 class Worker(QRunnable):
@@ -185,6 +93,7 @@ class RemoteWindow(QMainWindow):
         self.settings = QSettings("roku-remote", "roku-remote")
         self.devices = json.loads(self.settings.value("devices", "[]"))
         self._recovering = False
+        self._link = "idle"
         self._retries = 0
         self._scanning = False
         self._retry = QTimer(self)
@@ -214,112 +123,168 @@ class RemoteWindow(QMainWindow):
         return self.devices[index] if 0 <= index < len(self.devices) else None
 
     def _build_ui(self):
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 12, 16, 10)
-        layout.setSpacing(10)
+        # No system title bar: the window is a frameless, translucent
+        # top-level and the rounded Card is everything that's drawn.
+        self.setWindowFlag(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        card = ui.Card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(12)
 
-        top = QHBoxLayout()
-        self.power_btn = self._button("⏻", self.toggle_power, "powerButton", "Power")
-        self.power_btn.setFixedSize(36, 36)
+        # Title bar. Any empty area of the window drags it (mousePressEvent).
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        logo = QLabel()
+        if _icon_path().exists():
+            pixmap = QPixmap(str(_icon_path())).scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap.setDevicePixelRatio(2)
+            logo.setPixmap(pixmap)
         title = QLabel("Roku Remote")
-        title.setStyleSheet("font-size: 16px; font-weight: bold;")
-        refresh = self._button("⟳", self.discover, tip="Discover devices")
-        refresh.setFixedSize(36, 36)
-        top.addWidget(self.power_btn)
-        top.addStretch()
-        top.addWidget(title)
-        top.addStretch()
-        top.addWidget(refresh)
-        layout.addLayout(top)
+        title.setObjectName("title")
+        title_row.addWidget(logo)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        title_row.addWidget(self._icon_button("minimize", self.showMinimized, "windowButton", "Minimize", 28, 16))
+        title_row.addWidget(self._icon_button("close", self.close, "closeButton", "Close (Ctrl+Q)", 28, 16))
+        layout.addLayout(title_row)
 
         device_row = QHBoxLayout()
-        self.device_box = QComboBox()
+        device_row.setSpacing(8)
+        self.device_box = ui.DeviceCombo()
+        self.device_box.setObjectName("deviceBox")
+        self.device_box.setItemDelegate(QStyledItemDelegate(self.device_box))
+        self.device_box.setIconSize(QSize(10, 10))
+        self.device_box.setFocusPolicy(Qt.NoFocus)
+        self.device_box.setCursor(Qt.PointingHandCursor)
+        self.device_box.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.device_box.currentIndexChanged.connect(self._device_changed)
-        add_ip = self._button("+", self.add_by_ip, tip="Add device by IP")
-        add_ip.setFixedSize(36, 36)
         device_row.addWidget(self.device_box, stretch=1)
-        device_row.addWidget(add_ip)
+        device_row.addWidget(self._icon_button("refresh", self.discover, "iconButton", "Discover devices", 38, 18))
+        device_row.addWidget(self._icon_button("plus", self.add_by_ip, "iconButton", "Add device by IP", 38, 20))
         layout.addLayout(device_row)
 
         nav = QHBoxLayout()
-        nav.addWidget(self._key_button("◁  Back", "Back"))
-        nav.addWidget(self._key_button("Home  ⌂", "Home"))
+        nav.setSpacing(10)
+        nav.addWidget(self._key_button("Back", "Back", icon="back"))
+        nav.addWidget(self._icon_button("power", self.toggle_power, "powerButton", "Power", 44, 20, ui.POWER_RED))
+        nav.addWidget(self._key_button("Home", "Home", icon="home"))
         layout.addLayout(nav)
 
-        pad = QGridLayout()
-        pad.setSpacing(6)
-        up = self._key_button("▲", "Up", "padButton")
-        down = self._key_button("▼", "Down", "padButton")
-        left = self._key_button("◀", "Left", "padButton")
-        right = self._key_button("▶", "Right", "padButton")
-        ok = self._key_button("OK", "Select", "okButton")
-        for btn in (up, down, left, right):
-            btn.setMinimumSize(62, 62)
-        ok.setFixedSize(62, 62)
-        pad.addWidget(up, 0, 1)
-        pad.addWidget(left, 1, 0)
-        pad.addWidget(ok, 1, 1)
-        pad.addWidget(right, 1, 2)
-        pad.addWidget(down, 2, 1)
-        pad_wrap = QHBoxLayout()
-        pad_wrap.addStretch()
-        pad_wrap.addLayout(pad)
-        pad_wrap.addStretch()
-        layout.addLayout(pad_wrap)
+        self.dpad = ui.DPad(200)
+        self.dpad.activated.connect(self.send_key)
+        pad_row = QHBoxLayout()
+        pad_row.addStretch()
+        pad_row.addWidget(self.dpad)
+        pad_row.addStretch()
+        layout.addLayout(pad_row)
 
         extras = QHBoxLayout()
-        extras.addWidget(self._key_button("↺ Replay", "InstantReplay"))
-        extras.addWidget(self._key_button("＊ Options", "Info"))
+        extras.setSpacing(10)
+        extras.addWidget(self._key_button("Replay", "InstantReplay", icon="replay"))
+        extras.addWidget(self._key_button("Options", "Info", icon="options"))
         layout.addLayout(extras)
 
-        media = QHBoxLayout()
-        media.addWidget(self._key_button("◀◀ Rew", "Rev"))
-        media.addWidget(self._key_button("▶ Play/Pause", "Play"))
-        media.addWidget(self._key_button("FF ▶▶", "Fwd"))
-        layout.addLayout(media)
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+        controls.addWidget(self._segment([
+            ("rewind", "Rev", "Rewind (,)"),
+            ("play_pause", "Play", "Play / pause (Space)"),
+            ("forward", "Fwd", "Fast-forward (.)"),
+        ]), stretch=1)
+        controls.addWidget(self._segment([
+            ("vol_down", "VolumeDown", "Volume down (-)"),
+            ("mute", "VolumeMute", "Mute (M)"),
+            ("vol_up", "VolumeUp", "Volume up (=)"),
+        ]), stretch=1)
+        layout.addLayout(controls)
 
-        volume = QHBoxLayout()
-        volume.addWidget(self._key_button("Vol −", "VolumeDown"))
-        volume.addWidget(self._key_button("Mute", "VolumeMute"))
-        volume.addWidget(self._key_button("Vol +", "VolumeUp"))
-        layout.addLayout(volume)
-
-        self.apps_row = QHBoxLayout()
+        # Fixed height so the window doesn't jump when app tiles load.
+        apps = QWidget()
+        apps.setFixedHeight(40)
+        self.apps_row = QHBoxLayout(apps)
+        self.apps_row.setContentsMargins(0, 0, 0, 0)
         self.apps_row.setSpacing(6)
-        layout.addLayout(self.apps_row)
+        layout.addWidget(apps)
 
         text_row = QHBoxLayout()
+        text_row.setSpacing(8)
         self.text_input = QLineEdit()
         self.text_input.setPlaceholderText("Type to send text to the TV…")
         self.text_input.returnPressed.connect(self.send_text)
-        send = self._button("Send", self.send_text)
         text_row.addWidget(self.text_input, stretch=1)
-        text_row.addWidget(send)
+        text_row.addWidget(self._icon_button("send", self.send_text, "sendButton", "Send text", 36, 18))
         layout.addLayout(text_row)
 
         self.status = QLabel(KEY_HINTS)
         self.status.setObjectName("statusLabel")
         self.status.setWordWrap(True)
         self.status.setAlignment(Qt.AlignCenter)
+        self.status.setFixedHeight(44)  # three lines: room for the longest hint
         layout.addWidget(self.status)
 
-        self.setCentralWidget(root)
-        self.setFixedWidth(340)
+        # The card holds keyboard focus so the arrow-key shortcuts work at
+        # launch; otherwise the text box (first focusable widget) takes it
+        # and suspends them.
+        card.setFocusPolicy(Qt.ClickFocus)
+        self.setCentralWidget(card)
+        card.setFocus()
+        self.setFixedWidth(360)
+        self.adjustSize()
+        self.setFixedSize(self.size())
 
-    def _button(self, label, slot, object_name=None, tip=None):
+    def _button(self, label, slot, object_name=None, tip=None, icon=None, icon_size=18):
         btn = QPushButton(label)
         if object_name:
             btn.setObjectName(object_name)
         if tip:
             btn.setToolTip(tip)
+            btn.setAccessibleName(tip)
+        if icon:
+            btn.setIcon(ui.icon(icon, size=icon_size))
+            btn.setIconSize(QSize(icon_size, icon_size))
         btn.clicked.connect(slot)
         btn.setFocusPolicy(Qt.NoFocus)
+        btn.setCursor(Qt.PointingHandCursor)
         btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         return btn
 
-    def _key_button(self, label, key, object_name=None):
-        return self._button(label, lambda: self.send_key(key), object_name, tip=key)
+    def _icon_button(self, icon, slot, object_name, tip, size, icon_size, color=ui.TEXT):
+        btn = self._button("", slot, object_name, tip)
+        btn.setIcon(ui.icon(icon, color, icon_size))
+        btn.setIconSize(QSize(icon_size, icon_size))
+        btn.setFixedSize(size, size)
+        return btn
+
+    def _key_button(self, label, key, object_name=None, icon=None):
+        btn = self._button(label, lambda: self.send_key(key), object_name, tip=key, icon=icon)
+        btn.setFixedHeight(40)
+        return btn
+
+    def _segment(self, items):
+        """A pill holding a few icon-only key buttons (media, volume)."""
+        frame = QFrame()
+        frame.setObjectName("segment")
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(3, 3, 3, 3)
+        row.setSpacing(2)
+        for icon, key, tip in items:
+            btn = self._icon_button(icon, lambda _=False, k=key: self.send_key(k), "segButton", tip, 34, 20)
+            btn.setMinimumWidth(0)
+            btn.setMaximumWidth(16777215)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            row.addWidget(btn)
+        return frame
+
+    def mousePressEvent(self, event):
+        # Frameless window: let the compositor move it from any spot that
+        # isn't a control (works on Wayland, where apps can't self-position).
+        if event.button() == Qt.LeftButton and self.windowHandle():
+            self.centralWidget().setFocus()  # clicking off the text box returns keys to the remote
+            self.windowHandle().startSystemMove()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def _bind_keys(self):
         self.shortcuts = []
@@ -345,12 +310,17 @@ class RemoteWindow(QMainWindow):
             shortcut.setContext(Qt.WindowShortcut)
             shortcut.activated.connect(lambda k=roku_key: self.send_key(k))
             self.shortcuts.append(shortcut)
+        for sequence in ("Ctrl+Q", "Ctrl+W"):
+            QShortcut(QKeySequence(sequence), self, activated=self.close)
         self.text_input.installEventFilter(self)
 
     def eventFilter(self, obj, event):
         # The text input owns its keystrokes; suspend remote shortcuts
         # while it has focus so typing isn't hijacked.
         if obj is self.text_input:
+            if event.type() == event.Type.KeyPress and event.key() == Qt.Key_Escape:
+                self.centralWidget().setFocus()
+                return True
             if event.type() == event.Type.FocusIn:
                 for shortcut in self.shortcuts:
                     shortcut.setEnabled(False)
@@ -364,8 +334,12 @@ class RemoteWindow(QMainWindow):
     def _restore_devices(self):
         self.device_box.blockSignals(True)
         self.device_box.clear()
-        for device in self.devices:
-            self.device_box.addItem(f"{device['name']}  ({device['ip']})", device["ip"])
+        names = [d["name"] for d in self.devices]
+        for i, device in enumerate(self.devices):
+            # Show the IP only when it's needed to tell two TVs apart.
+            label = device["name"] if names.count(device["name"]) == 1 else f"{device['name']}  ({device['ip']})"
+            self.device_box.addItem(label, device["ip"])
+            self.device_box.setItemData(i, device["ip"], Qt.ToolTipRole)
         index = self._index_of({
             "serial": self.settings.value("last_serial"),
             "ip": self.settings.value("last_ip"),
@@ -373,8 +347,19 @@ class RemoteWindow(QMainWindow):
         if index >= 0:
             self.device_box.setCurrentIndex(index)
         self.device_box.blockSignals(False)
+        self._set_link(self._link)
         if self.ip:
             self.connect()
+
+    def _set_link(self, state):
+        """Connection dot on the selected device in the picker."""
+        self._link = state
+        current = self.device_box.currentIndex()
+        for i in range(self.device_box.count()):
+            self.device_box.setItemIcon(i, ui.dot_icon(state if i == current else "idle"))
+        device = self.selected
+        if device:
+            self.device_box.setToolTip(f"{device['name']}\n{device['ip']} · {LINK_TIPS[state]}")
 
     def _save_devices(self):
         self.settings.setValue("devices", json.dumps(self.devices))
@@ -413,6 +398,7 @@ class RemoteWindow(QMainWindow):
         self.set_status(f"Connecting to {name}…", sticky=True)
         want = self.selected
         log.info("Connecting to %s", self._describe(want))
+        self._set_link("busy")
         self.run_job(ecp.get_device, self.ip, on_done=lambda device: self._connected(device, want))
 
     def _connected(self, device, want):
@@ -429,6 +415,7 @@ class RemoteWindow(QMainWindow):
         # Fold in any name/serial drift picked up on reconnect, then
         # show a clear connected state and load the app shortcuts.
         log.info("Connected to %s", self._describe(device))
+        self._set_link("ok")
         self._end_recovery()
         self._merge_devices([device])
         self._save_devices()
@@ -506,6 +493,7 @@ class RemoteWindow(QMainWindow):
         self._recovering = True
         self._retries = 0
         log.warning("Lost %s; rescanning the network", self._describe(self.selected))
+        self._set_link("busy")
         name = self.device_box.currentText() or "the TV"
         self.set_status(f"Can't reach {name} — rescanning the network…", sticky=True)
         self._rescan()
@@ -544,6 +532,7 @@ class RemoteWindow(QMainWindow):
             # and its failure must not start a second scan. Keep retrying
             # so the TV reconnects once it's powered on or back online.
             delay = self._schedule_retry()
+            self._set_link("lost")
             log.warning("%s not found (attempt %d); retrying in %d s",
                         self._describe(selected), self._retries, delay)
             self.set_status(
@@ -556,6 +545,7 @@ class RemoteWindow(QMainWindow):
         if not self._recovering:
             return
         delay = self._schedule_retry()
+        self._set_link("lost")
         log.warning("Rescan failed (%s: %s, attempt %d); retrying in %d s",
                     type(exc).__name__, exc, self._retries, delay)
         self.set_status("TV unreachable and network scan failed — retrying…", sticky=True)
@@ -603,6 +593,7 @@ class RemoteWindow(QMainWindow):
     def send_key(self, key):
         if not self._require_device():
             return
+        self.dpad.flash(key)
         self.run_job(ecp.send_key, self.ip, key)
 
     def toggle_power(self):
@@ -654,8 +645,9 @@ class RemoteWindow(QMainWindow):
             btn = QPushButton()
             btn.setObjectName("appButton")
             btn.setToolTip(app["name"])
-            btn.setFixedSize(48, 36)
+            btn.setFixedSize(49, 38)
             btn.setFocusPolicy(Qt.NoFocus)
+            btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _=False, a=app: self.launch_app(a))
             self.apps_row.addWidget(btn)
             self.run_job(
@@ -753,7 +745,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Roku Remote")
     app.setDesktopFileName("roku-remote")
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(ui.STYLE)
     if _icon_path().exists():
         app.setWindowIcon(QIcon(str(_icon_path())))
     window = RemoteWindow()
