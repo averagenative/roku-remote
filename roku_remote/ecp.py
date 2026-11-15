@@ -106,6 +106,12 @@ def _device_info(ip: str) -> ElementTree.Element:
 def get_device(ip: str) -> dict:
     tree = _device_info(ip)
     name = tree.findtext("user-device-name") or tree.findtext("friendly-device-name")
+    # The Roku app and my.roku.com label a device "<location> • <name>".
+    # Many TVs only ever get a location ("Master bedroom") and keep the
+    # stock name, so the name alone leaves identical TVs indistinguishable.
+    location = (tree.findtext("user-device-location") or "").strip()
+    if location and name and location.lower() not in name.lower():
+        name = f"{location} · {name}"
     serial = tree.findtext("serial-number")
     # Power-mode transitions (PowerOn / Ready / Suspend…) are logged once
     # each, not on every heartbeat: they're what to line up against a
